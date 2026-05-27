@@ -18,13 +18,11 @@ public:
         , capacity_(capacity) {
     }
 
+    //std::exchange — вспомогательная функция из заголовка <utility> в C++,
+    //которая заменяет значение объекта новым значением и возвращает его старое значение.
     RawMemory(RawMemory&& other) noexcept
-        : buffer_(other.buffer_)
-        , capacity_(other.capacity_)
-    {
-        other.buffer_ = nullptr;
-        other.capacity_ = 0;
-    }
+        : buffer_(std::exchange(other.buffer_, nullptr))
+        , capacity_(std::exchange(other.capacity_, 0)){}
 
     ~RawMemory() {
         Deallocate(buffer_);
@@ -36,11 +34,7 @@ public:
 
     RawMemory& operator=(RawMemory&& rhs) noexcept {
         if(this != &rhs){
-            buffer_ = rhs.buffer_;
-            capacity_ = rhs.capacity_;
-
-            rhs.buffer_ = nullptr;
-            rhs.capacity_ = 0;
+            Swap(rhs);
         }
 
         return *this;
@@ -128,20 +122,7 @@ public:
         : data_(size)
         , size_(size)
     {
-        size_t i = 0;
-
-        try{
-            for (; i != size; ++i) {
-                new (data_ + i) T();
-            }
-        } catch (...){
-            // В переменной i содержится количество созданных элементов.
-            // Теперь их надо разрушить
-            DestroyN(data_.GetAddress(), i);
-
-            // Перевыбрасываем пойманное исключение, чтобы сообщить об ошибке создания объекта
-            throw;
-        }
+        std::uninitialized_default_construct_n(data_.GetAddress(), size);
     }
 
     // Копирующий конструктор.
@@ -152,15 +133,7 @@ public:
         : data_(other.Size())
         , size_(other.Size())
     {
-        for (size_t i = 0; i != other.size_; ++i) {
-            try{
-                CopyConstruct(data_ + i, other.data_[i]);
-            }catch(...){
-                DestroyN(data_.GetAddress(), i);
-                throw;
-            }
-
-        }
+        std::uninitialized_copy_n(other.data_.GetAddress(), other.size_,data_.GetAddress());
     }
 
     // Перемещающий конструктор.
@@ -201,61 +174,11 @@ public:
     }
 
     void PushBack(const T& value) {
-        if (size_ == data_.Capacity()) {
-            RawMemory<T> new_data(size_ == 0 ? 1 : size_ * 2);
-
-            // Размещаем новый элемент последним
-            new (new_data + size_) T(value);
-
-            try {
-                // Выбираем стратегию переноса старых элементов
-                if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
-                    // Можно безопасно перемещать
-                    std::uninitialized_move_n(data_.GetAddress(), size_, new_data.GetAddress());
-                } else {
-                    // Приходится копировать
-                    std::uninitialized_copy_n(data_.GetAddress(), size_, new_data.GetAddress());
-                }
-            } catch (...) {
-                std::destroy_at(new_data + size_);
-                throw;
-            }
-
-            std::destroy_n(data_.GetAddress(), size_);
-            data_.Swap(new_data);
-        } else {
-            new (data_ + size_) T(value);
-        }
-        ++size_;
+        EmplaceBack(value);
     }
 
     void PushBack(T&& value) {
-        if (size_ == data_.Capacity()) {
-            RawMemory<T> new_data(size_ == 0 ? 1 : size_ * 2);
-
-            // Размещаем новый элемент последним (всегда перемещаем для rvalue)
-            new (new_data + size_) T(std::move(value));
-
-            try {
-                // Выбираем стратегию переноса старых элементов
-                if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
-                    // Можно безопасно перемещать старые элементы
-                    std::uninitialized_move_n(data_.GetAddress(), size_, new_data.GetAddress());
-                } else {
-                    // Приходится копировать старые элементы
-                    std::uninitialized_copy_n(data_.GetAddress(), size_, new_data.GetAddress());
-                }
-            } catch (...) {
-                std::destroy_at(new_data + size_);
-                throw;
-            }
-
-            std::destroy_n(data_.GetAddress(), size_);
-            data_.Swap(new_data);
-        } else {
-            new (data_ + size_) T(std::move(value));
-        }
-        ++size_;
+        EmplaceBack(std::move(value));
     }
 
     template <typename... Args>
@@ -293,92 +216,21 @@ public:
 
     template <typename... Args>
     iterator Emplace(const_iterator pos, Args&&... args) {
+        //Проверка на вхождение в диапозон
+        assert(pos >= begin() && pos <= end());
+
         // Определяем позицию вставки как смещение от начала
         size_t index = pos - begin();
 
-        // Случай 1: требуется релокация памяти
         if (size_ == data_.Capacity()) {
-            RawMemory<T> new_data(size_ == 0 ? 1 : size_ * 2);
+            // Случай 1: требуется релокация памяти
+            return EmplaceWithReallocation(index, std::forward<Args>(args)...);
 
-            // 1) Сначала конструируем новый элемент в новой памяти
-            //    Это защищает от ситуации, когда args ссылается на элемент текущего вектора
-            try {
-                new (new_data + index) T(std::forward<Args>(args)...);
-            } catch (...) {
-                // Если исключение, новая память сама очистится через деструктор RawMemory
-                throw;
-            }
-
-            // 2) Копируем/перемещаем элементы, которые идут ДО позиции вставки
-            if (index > 0) {
-                try {
-                    if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
-                        std::uninitialized_move_n(data_.GetAddress(), index, new_data.GetAddress());
-                    } else {
-                        std::uninitialized_copy_n(data_.GetAddress(), index, new_data.GetAddress());
-                    }
-                } catch (...) {
-                    // Уничтожаем уже созданный новый элемент
-                    std::destroy_at(new_data + index);
-                    throw;
-                }
-            }
-
-            // 3) Копируем/перемещаем элементы, которые идут ПОСЛЕ позиции вставки
-            if (size_ > index) {
-                try {
-                    if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
-                        std::uninitialized_move_n(data_.GetAddress() + index, size_ - index,
-                                                  new_data.GetAddress() + index + 1);
-                    } else {
-                        std::uninitialized_copy_n(data_.GetAddress() + index, size_ - index,
-                                                  new_data.GetAddress() + index + 1);
-                    }
-                } catch (...) {
-                    // Уничтожаем всё, что успели создать: [0, index] + вставленный элемент
-                    std::destroy_n(new_data.GetAddress(), index + 1);
-                    throw;
-                }
-            }
-
-            // 4) Уничтожаем старые элементы и заменяем буфер
-            std::destroy_n(data_.GetAddress(), size_);
-            data_.Swap(new_data);
-            ++size_;
-
-            return begin() + index;
+        } else {
+            // Случай 2: релокация не нужна
+            return EmplaceWithoutReallocation(index, std::forward<Args>(args)...);
         }
 
-        // Случай 2: релокация не нужна
-        else {
-            // Вставка в конец
-            if (index == size_) {
-                new (data_ + size_) T(std::forward<Args>(args)...);
-
-                ++size_;
-                return begin() + index;
-            }
-
-            // Создаём временную копию/перемещение вставляемого значения (защита от самовставки)
-            T temp(std::forward<Args>(args)...);
-
-
-            // Сначала создаём копию последнего элемента в неинициализированной области
-            new (data_ + size_) T(std::move(data_[size_ - 1]));
-
-            // Сдвигаем диапазон [index, size_-1] вправо на 1
-            // Используем move_backward, чтобы не затереть элементы
-            std::move_backward(data_.GetAddress() + index,
-                               data_.GetAddress() + size_ - 1,
-                               data_.GetAddress() + size_);
-
-            // Вставляем временное значение
-            data_[index] = std::move(temp);
-
-
-            ++size_;
-            return begin() + index;
-        }
     }
 
 
@@ -392,12 +244,15 @@ public:
     }
 
     iterator Erase(const_iterator pos) {
+        //Проверка на вхождение в диапозон
+        assert(pos >= begin() && pos <= end());
+
         size_t index = pos - begin();
 
         // Сдвигаем элементы влево
-        for (size_t i = index; i < size_ - 1; ++i) {
-            data_[i] = std::move(data_[i + 1]);
-        }
+        std::move(data_.GetAddress() + index + 1,
+                  data_.GetAddress() + size_,
+                  data_.GetAddress() + index);
 
         // Уничтожаем последний элемент (который теперь "дублируется")
         std::destroy_at(data_ + size_ - 1);
@@ -406,10 +261,20 @@ public:
         return begin() + index;
     }
 
-    void PopBack() noexcept{
-        std::destroy_at(data_ + (size_ - 1));
-        size_--;
+    bool Empty() const noexcept{
+        return size_ == 0;
     }
+
+
+    void PopBack() noexcept{
+        if(!Empty()){
+            std::destroy_at(data_ + (size_ - 1));
+            size_--;
+        }
+
+    }
+
+
 
     // Метод void Reserve(size_t capacity).
     // Резервирует достаточно места, чтобы вместить количество элементов, равное capacity.
@@ -449,40 +314,19 @@ public:
     Vector& operator=(const Vector& rhs){
         if (this != &rhs) {
             if (rhs.size_ > data_.Capacity()) {
+                //Размер больше вместимости
                 /* copy-and-swap */
                 Vector buffer(rhs);
                 Swap(buffer);
 
             } else {
-
-                size_t i = 0;
-
-                // 1. Обновляем существующие элементы
-                for (; i < std::min(size_, rhs.size_); ++i) {
-                    data_[i] = rhs.data_[i];
-                }
-
-                // Если rhs больше - добавляем новые элементы
-                if (rhs.size_ > size_) {
-                    try {
-                        std::uninitialized_copy_n(rhs.data_ + i, rhs.size_ - i, data_ + i);
-                    } catch (...) {
-                        // В случае исключения - разрушаем уже обновлённые элементы
-                        // и перевыбрасываем
-                        DestroyN(data_.GetAddress(), i);
-                        throw;
-                    }
-                }
-                // Если rhs меньше - удаляем лишние
-                else if (size_ > rhs.size_) {
-                    DestroyN(data_.GetAddress() + rhs.size_, size_ - rhs.size_);
-                }
-
-                size_ = rhs.size_;
+                //Размер меньше вместимости
+                CopyAssignNoReallocation(rhs);
             }
         }
         return *this;
     }
+
 
     Vector& operator=(Vector&& rhs) noexcept{
         if (this != &rhs) {
@@ -547,7 +391,107 @@ private:
     static void Destroy(T* buf) noexcept {
         buf->~T();
     }
+
+    void CopyAssignNoReallocation(const Vector& rhs){
+        // 1. Обновляем существующие элементы
+        auto copy_count = std::min(size_, rhs.size_);
+        std::copy(rhs.data_.GetAddress(), rhs.data_.GetAddress() + copy_count, data_.GetAddress());
+
+        size_t i = copy_count;
+
+        // Если rhs больше - добавляем новые элементы
+        if (rhs.size_ > size_) {
+            std::uninitialized_copy_n(rhs.data_ + i, rhs.size_ - i, data_ + i);
+        }
+
+        // Если rhs меньше - удаляем лишние
+        else if (size_ > rhs.size_) {
+            DestroyN(data_.GetAddress() + rhs.size_, size_ - rhs.size_);
+        }
+
+        size_ = rhs.size_;
+    }
+
+    template <typename... Args>
+    iterator EmplaceWithReallocation(size_t index, Args&&... args) {
+        RawMemory<T> new_data(size_ == 0 ? 1 : size_ * 2);
+
+        // 1) Сначала конструируем новый элемент в новой памяти
+        //    Это защищает от ситуации, когда args ссылается на элемент текущего вектора
+
+        // Если исключение, новая память сама очистится через деструктор RawMemory
+        new (new_data + index) T(std::forward<Args>(args)...);
+
+        // 2) Копируем/перемещаем элементы, которые идут ДО позиции вставки
+        if (index > 0) {
+            try {
+                if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
+                    std::uninitialized_move_n(data_.GetAddress(), index, new_data.GetAddress());
+                } else {
+                    std::uninitialized_copy_n(data_.GetAddress(), index, new_data.GetAddress());
+                }
+            } catch (...) {
+                // Уничтожаем уже созданный новый элемент
+                std::destroy_at(new_data + index);
+                throw;
+            }
+        }
+
+        // 3) Копируем/перемещаем элементы, которые идут ПОСЛЕ позиции вставки
+        if (size_ > index) {
+            try {
+                if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
+                    std::uninitialized_move_n(data_.GetAddress() + index, size_ - index,
+                                              new_data.GetAddress() + index + 1);
+                } else {
+                    std::uninitialized_copy_n(data_.GetAddress() + index, size_ - index,
+                                              new_data.GetAddress() + index + 1);
+                }
+            } catch (...) {
+                // Уничтожаем всё, что успели создать: [0, index] + вставленный элемент
+                std::destroy_n(new_data.GetAddress(), index + 1);
+                throw;
+            }
+        }
+
+        // 4) Уничтожаем старые элементы и заменяем буфер
+        std::destroy_n(data_.GetAddress(), size_);
+        data_.Swap(new_data);
+        ++size_;
+
+        return begin() + index;
+    }
+
+    template <typename... Args>
+    iterator EmplaceWithoutReallocation(size_t index, Args&&... args) {
+        // Вставка в конец
+        if (index == size_) {
+            EmplaceBack(std::forward<Args>(args)...);
+            return begin() + index;
+        }
+
+        // Создаём временную копию/перемещение вставляемого значения (защита от самовставки)
+        T temp(std::forward<Args>(args)...);
+
+        // Сначала создаём копию последнего элемента в неинициализированной области
+        new (data_ + size_) T(std::move(data_[size_ - 1]));
+
+        // Сдвигаем диапазон [index, size_-1] вправо на 1
+        // Используем move_backward, чтобы не затереть элементы
+        try{
+            std::move_backward(data_.GetAddress() + index,
+                               data_.GetAddress() + size_ - 1,
+                               data_.GetAddress() + size_);
+
+        }catch(...){
+            std::destroy_at(data_ + size_);
+            throw;
+        }
+
+        // Вставляем временное значение
+        data_[index] = std::move(temp);
+        ++size_;
+
+        return begin() + index;
+    }
 };
-
-
-
